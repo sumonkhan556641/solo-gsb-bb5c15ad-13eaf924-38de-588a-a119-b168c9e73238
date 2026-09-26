@@ -7,6 +7,7 @@ from app.timeutil import minute_bucket, to_ns
 from app.sampler import hash_score, select_by_hash, stable_hash
 from app.servicetime import exclusive_by_service, _union_length
 from app.concurrency import active_windows
+from app.integrity import check_integrity
 from app.models import SpanIn
 from pydantic import ValidationError
 
@@ -193,6 +194,166 @@ def test_active_windows_identical_spans_and_empty_input():
 def test_active_windows_rejects_min_active_below_two():
     with pytest.raises(ValueError):
         active_windows([_row("a", 0, 10)], 1)
+
+
+def _irow(span_id, start_ns, end_ns, *, parent=None):
+    return {
+        "span_id": span_id,
+        "parent_span_id": parent,
+        "start_ns": start_ns,
+        "end_ns": end_ns,
+    }
+
+
+def _anomaly_map(result):
+    return {(a["span_id"], a["type"]): a for a in result["anomalies"]}
+
+
+def test_integrity_empty_and_clean_tree():
+    assert check_integrity([]) == {
+        "span_count": 0, "valid": True, "anomalies": []
+    }
+    rows = [
+        _irow("root", 0, 100),
+        _irow("a", 10, 90, parent="root"),
+        _irow("b", 20, 30, parent="a"),
+    ]
+    result = check_integrity(rows)
+    assert result["span_count"] == 3
+    assert result["valid"] is True
+    assert result["anomalies"] == []
+
+
+def test_integrity_missing_parent():
+    rows = [
+        _irow("orphan", 0, 10, parent="absent"),
+        _irow("root", 0, 10),
+    ]
+    result = check_integrity(rows)
+    assert result["valid"] is False
+    assert result["anomalies"] == [{
+        "type": "missing_parent",
+        "span_id": "orphan",
+        "parent_span_id": "absent",
+    }]
+
+
+def test_integrity_self_reference_is_its_own_anomaly():
+    rows = [_irow("loop", 0, 30, parent="loop")]
+    result = check_integrity(rows)
+    assert result["anomalies"] == [{
+        "type": "self_reference", "span_id": "loop",
+    }]
+    # The self edge must not be re-reported as a multi-node cycle.
+    assert all(a["type"] != "cycle" for a in result["anomalies"])
+
+
+def test_integrity_two_node_cycle_reported_once_and_order_independent():
+    rows_a = [
+        _irow("a", 0, 10, parent="b"),
+        _irow("b", 0, 10, parent="a"),
+    ]
+    rows_b = list(reversed(rows_a))
+    for rows in (rows_a, rows_b):
+        result = check_integrity(rows)
+        assert result["valid"] is False
+        assert len(result["anomalies"]) == 1
+        anomaly = result["anomalies"][0]
+        assert anomaly["type"] == "cycle"
+        assert anomaly["span_id"] == "a"          # smallest member first
+        assert anomaly["cycle"] == ["a", "b"]
+
+
+def test_integrity_three_node_cycle_rotated_to_smallest_member():
+    rows = [
+        _irow("c", 0, 10, parent="a"),
+        _irow("b", 0, 10, parent="c"),
+        _irow("a", 0, 10, parent="b"),
+    ]
+    result = check_integrity(rows)
+    assert len(result["anomalies"]) == 1
+    assert result["anomalies"][0]["cycle"] == ["a", "b", "c"]
+
+
+def test_integrity_distinct_cycles_are_each_reported_once():
+    rows = [
+        _irow("a", 0, 10, parent="b"),
+        _irow("b", 0, 10, parent="a"),
+        _irow("x", 0, 10, parent="y"),
+        _irow("y", 0, 10, parent="x"),
+    ]
+    result = check_integrity(rows)
+    cycles = [a for a in result["anomalies"] if a["type"] == "cycle"]
+    assert len(cycles) == 2
+    assert [c["cycle"] for c in cycles] == [["a", "b"], ["x", "y"]]
+
+
+def test_integrity_time_bounds_detects_start_and_end_overrun():
+    rows = [
+        _irow("root", 10, 100),
+        _irow("early", 5, 50, parent="root"),     # starts before parent
+        _irow("late", 20, 120, parent="root"),    # ends after parent
+        _irow("ok", 10, 100, parent="root"),      # equal endpoints are fine
+    ]
+    result = check_integrity(rows)
+    amap = _anomaly_map(result)
+    assert set(amap) == {("early", "time_out_of_bounds"),
+                         ("late", "time_out_of_bounds")}
+    assert amap[("early", "time_out_of_bounds")] == {
+        "type": "time_out_of_bounds",
+        "span_id": "early",
+        "parent_span_id": "root",
+        "parent_start_ns": 10,
+        "parent_end_ns": 100,
+        "span_start_ns": 5,
+        "span_end_ns": 50,
+    }
+
+
+def test_integrity_cyclic_edges_skip_time_bounds():
+    # Every edge violates containment, but all belong to the ring.
+    rows = [
+        _irow("a", 100, 200, parent="b"),
+        _irow("b", 0, 50, parent="a"),
+    ]
+    result = check_integrity(rows)
+    assert [a["type"] for a in result["anomalies"]] == ["cycle"]
+
+
+def test_integrity_missing_parent_edge_skips_time_bounds():
+    rows = [_irow("orphan", 0, 999, parent="ghost")]
+    result = check_integrity(rows)
+    assert [a["type"] for a in result["anomalies"]] == ["missing_parent"]
+
+
+def test_integrity_node_outside_a_cycle_is_still_time_checked():
+    # x -> a points into the ring; a exists and the x->a edge is not itself a
+    # cycle edge, so its time overrun must still be reported.
+    rows = [
+        _irow("a", 10, 20, parent="b"),
+        _irow("b", 10, 20, parent="a"),
+        _irow("x", 0, 99, parent="a"),
+    ]
+    result = check_integrity(rows)
+    amap = _anomaly_map(result)
+    assert ("a", "cycle") in amap
+    assert ("x", "time_out_of_bounds") in amap
+
+
+def test_integrity_anomalies_sorted_by_span_id_then_type():
+    rows = [
+        _irow("zroot", 0, 10),
+        _irow("zchild", 20, 30, parent="zroot"),  # time overrun
+        _irow("morph", 0, 5, parent="nope"),      # missing parent
+        _irow("aloop", 0, 5, parent="aloop"),     # self reference
+    ]
+    result = check_integrity(rows)
+    assert [(a["span_id"], a["type"]) for a in result["anomalies"]] == [
+        ("aloop", "self_reference"),
+        ("morph", "missing_parent"),
+        ("zchild", "time_out_of_bounds"),
+    ]
+    assert result["valid"] is False
 
 
 def test_epoch_units_are_normalized_to_ns():

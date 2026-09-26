@@ -116,6 +116,34 @@ class ConcurrencyResponse(BaseModel):
     windows: list[ConcurrencyWindow]
 
 
+class IntegrityAnomaly(BaseModel):
+    # missing_parent: child references a span not present in the snapshot.
+    # self_reference: parent_span_id == span_id.
+    # cycle: two or more distinct spans form a parent ring (reported once).
+    # time_out_of_bounds: child interval is not contained in the parent's.
+    type: Literal["missing_parent", "self_reference", "cycle",
+                  "time_out_of_bounds"]
+    # The offending child span; for cycles, the canonical (smallest) member.
+    span_id: str
+    # Missing-parent / time-bound anomalies name the referenced parent.
+    parent_span_id: str | None = None
+    # Ordered members of the ring, smallest member first (cycles only).
+    cycle: list[str] | None = None
+    # Nanosecond intervals for time-bound anomalies.
+    parent_start_ns: int | None = None
+    parent_end_ns: int | None = None
+    span_start_ns: int | None = None
+    span_end_ns: int | None = None
+
+
+class IntegrityResponse(BaseModel):
+    trace_id: str
+    span_count: int
+    # False when the current snapshot contains at least one anomaly.
+    valid: bool
+    anomalies: list[IntegrityAnomaly]
+
+
 class StatsResponse(BaseModel):
     open_traces: int
     pending_normal: int

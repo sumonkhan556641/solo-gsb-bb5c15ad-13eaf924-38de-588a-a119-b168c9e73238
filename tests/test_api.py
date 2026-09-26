@@ -379,6 +379,120 @@ def test_concurrency_works_after_close(client):
     }]
 
 
+def test_integrity_unknown_trace_returns_404(client):
+    resp = client.get("/api/v1/traces/no-such-trace/integrity")
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "trace not found"
+
+
+def test_integrity_clean_open_trace_is_valid(client):
+    tid = "int-clean"
+    client.post("/api/v1/spans:batch", json={"spans": [
+        _custom_span(tid, "root", 0, 100, service="svc"),
+        _custom_span(tid, "child", 10, 90, service="svc",
+                     parent_span_id="root"),
+    ]})
+    resp = client.get(f"/api/v1/traces/{tid}/integrity")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body == {
+        "trace_id": tid,
+        "span_count": 2,
+        "valid": True,
+        "anomalies": [],
+    }
+
+
+def test_integrity_open_snapshot_then_arriving_parent_clears(client):
+    tid = "int-open"
+    # Only the child has arrived: its parent is missing in the snapshot.
+    client.post("/api/v1/spans:batch", json={"spans": [
+        _custom_span(tid, "child", 10, 90, service="svc",
+                     parent_span_id="root"),
+    ]})
+    body = client.get(f"/api/v1/traces/{tid}/integrity").json()
+    assert body["span_count"] == 1
+    assert body["valid"] is False
+    assert body["anomalies"] == [{
+        "type": "missing_parent",
+        "span_id": "child",
+        "parent_span_id": "root",
+        "cycle": None,
+        "parent_start_ns": None,
+        "parent_end_ns": None,
+        "span_start_ns": None,
+        "span_end_ns": None,
+    }]
+
+    # Parent arrives (still an open trace): recomputed snapshot is valid.
+    client.post("/api/v1/spans:batch", json={"spans": [
+        _custom_span(tid, "root", 0, 100, service="svc"),
+    ]})
+    body = client.get(f"/api/v1/traces/{tid}/integrity").json()
+    assert body["span_count"] == 2
+    assert body["valid"] is True
+    assert body["anomalies"] == []
+
+
+def test_integrity_reports_self_cycle_missing_and_time_overrun(client):
+    tid = "int-bad"
+    client.post("/api/v1/spans:batch", json={"spans": [
+        _custom_span(tid, "root", 0, 100, service="svc"),
+        # Time overrun: ends after the parent.
+        _custom_span(tid, "late", 10, 120, service="svc",
+                     parent_span_id="root"),
+        # Self reference.
+        _custom_span(tid, "loop", 10, 20, service="svc",
+                     parent_span_id="loop"),
+        # Points at a span that never arrives.
+        _custom_span(tid, "orphan", 0, 5, service="svc",
+                     parent_span_id="ghost"),
+        # Multi-node cycle a -> b -> a, reported once.
+        _custom_span(tid, "a", 30, 40, service="svc", parent_span_id="b"),
+        _custom_span(tid, "b", 30, 40, service="svc", parent_span_id="a"),
+    ]})
+
+    body = client.get(f"/api/v1/traces/{tid}/integrity").json()
+    assert body["span_count"] == 6
+    assert body["valid"] is False
+    amap = {(x["span_id"], x["type"]): x for x in body["anomalies"]}
+    assert set(amap) == {
+        ("a", "cycle"),
+        ("late", "time_out_of_bounds"),
+        ("loop", "self_reference"),
+        ("orphan", "missing_parent"),
+    }
+    cycle = amap[("a", "cycle")]
+    assert cycle["cycle"] == ["a", "b"]
+    overrun = amap[("late", "time_out_of_bounds")]
+    assert overrun["parent_span_id"] == "root"
+    ms = 10**6
+    base_ns = 1577836800 * 10**9 + 60 * 60 * 10**9
+    assert overrun["parent_start_ns"] == base_ns
+    assert overrun["parent_end_ns"] == base_ns + 100 * ms
+    assert overrun["span_end_ns"] == base_ns + 120 * ms
+
+    # Ordering: span_id ascending.
+    assert [(x["span_id"], x["type"]) for x in body["anomalies"]] == sorted(
+        (x["span_id"], x["type"]) for x in body["anomalies"]
+    )
+
+
+def test_integrity_still_available_after_close(client):
+    tid = "int-closed"
+    client.post("/api/v1/spans:batch", json={"spans": [
+        _custom_span(tid, "root", 0, 100, service="svc"),
+        _custom_span(tid, "child", 0, 200, service="svc",
+                     parent_span_id="root"),
+    ]})
+    client.post("/api/v1/admin/force-flush")
+    body = client.get(f"/api/v1/traces/{tid}/integrity").json()
+    assert body["span_count"] == 2
+    assert body["valid"] is False
+    assert body["anomalies"][0]["type"] == "time_out_of_bounds"
+    assert body["anomalies"][0]["span_id"] == "child"
+
+
 def test_decisions_survive_engine_restart(client, tmp_path):
     from app.config import Settings
     from app.engine import SamplingEngine

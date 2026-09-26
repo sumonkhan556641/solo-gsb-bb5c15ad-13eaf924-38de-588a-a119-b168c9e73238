@@ -250,6 +250,74 @@ curl -s "http://localhost:8080/api/v1/traces/abc-123/concurrency?min_active=2"
 * `min_active` defaults to `2`; values below 2 → `422`. Unknown trace id →
   `404`.
 
+### `GET /api/v1/traces/{trace_id}/integrity` — parent references and time bounds
+
+Validates the structural integrity of the spans received so far:
+
+* **`missing_parent`** — a span's `parent_span_id` points at a span that is
+  not present in the current snapshot.
+* **`self_reference`** — a span lists itself as its parent.
+* **`cycle`** — two or more distinct spans form a parent ring; each ring is
+  reported exactly once, with its members rotated so the smallest `span_id`
+  comes first.
+* **`time_out_of_bounds`** — for an edge whose parent exists and which is not
+  part of a cycle, the child's `[start_ns, end_ns]` interval is not contained
+  in the parent's interval (child starts before the parent or ends after it;
+  equal endpoints are fine). The offending child and both intervals are
+  included.
+
+Edges with a missing parent, self edges and cycle edges are not time-checked.
+Works on open traces too — it is computed from a consistent snapshot of the
+spans received so far, so a parent arriving later clears the anomaly on
+re-query. `valid` is `true` only when the snapshot has no anomalies.
+
+```bash
+curl -s http://localhost:8080/api/v1/traces/abc-123/integrity
+```
+
+```json
+{
+  "trace_id": "abc-123",
+  "span_count": 4,
+  "valid": false,
+  "anomalies": [
+    {
+      "type": "missing_parent",
+      "span_id": "00f067aa0ba902b7",
+      "parent_span_id": "absent-parent",
+      "cycle": null,
+      "parent_start_ns": null,
+      "parent_end_ns": null,
+      "span_start_ns": null,
+      "span_end_ns": null
+    },
+    {
+      "type": "cycle",
+      "span_id": "span-a",
+      "parent_span_id": null,
+      "cycle": ["span-a", "span-b"],
+      "parent_start_ns": null,
+      "parent_end_ns": null,
+      "span_start_ns": null,
+      "span_end_ns": null
+    },
+    {
+      "type": "time_out_of_bounds",
+      "span_id": "span-c",
+      "parent_span_id": "root",
+      "cycle": null,
+      "parent_start_ns": 1780000000000000000,
+      "parent_end_ns": 1780000100000000000,
+      "span_start_ns": 1780000000000000000,
+      "span_end_ns": 1780000200000000000
+    }
+  ]
+}
+```
+
+`anomalies` is sorted by `span_id` (the smallest ring member for cycles),
+then anomaly type. Unknown trace id → `404`.
+
 ### Other endpoints
 
 | Method & path | Purpose |
@@ -321,4 +389,6 @@ pytest -q
 The test suite covers priority budget saturation, slow/error classification,
 stable-hash fill counts, determinism, duplicate/late span handling, batch
 queries, timestamp formats, per-service exclusive-time computation,
-concurrent-span window detection, and crash recovery from SQLite.
+concurrent-span window detection, trace integrity checks (missing parents,
+self references, cycle reporting and time bounds), and crash recovery from
+SQLite.

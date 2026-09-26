@@ -20,6 +20,7 @@ import threading
 from typing import Any
 
 from . import concurrency
+from . import integrity
 from . import sampler
 from . import servicetime
 from .config import Settings
@@ -403,6 +404,22 @@ class SamplingEngine:
                 "total_concurrent_ns": sum(w["duration_ns"] for w in windows),
                 "windows": windows,
             }
+
+    def get_integrity(self, tid: str) -> dict[str, Any] | None:
+        """Validate parent references and time bounds from one snapshot.
+
+        Works for decided and open traces alike; for open traces the snapshot
+        spans exactly what has been received at query time (the engine lock
+        serializes against ingest, so an in-flight missing parent can simply
+        arrive later and clear on re-query). Returns None for unknown traces.
+        """
+        with self._lock:
+            if self.storage.get_trace(tid) is None:
+                return None
+            rows = list(self.storage.iter_span_rows(tid))
+            view = integrity.check_integrity(rows)
+            view["trace_id"] = tid
+            return view
 
     def stats(self) -> dict[str, Any]:
         with self._lock:
