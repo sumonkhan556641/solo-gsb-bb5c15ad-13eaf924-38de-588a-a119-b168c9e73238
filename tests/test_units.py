@@ -7,6 +7,13 @@ from app.timeutil import minute_bucket, to_ns
 from app.sampler import hash_score, select_by_hash, stable_hash
 from app.servicetime import exclusive_by_service, _union_length
 from app.concurrency import active_windows
+from app.integrity import (
+    CYCLE,
+    MISSING_PARENT,
+    SELF_REFERENCE,
+    TIME_OUT_OF_BOUNDS,
+    check_integrity,
+)
 from app.models import SpanIn
 from pydantic import ValidationError
 
@@ -260,3 +267,166 @@ def test_select_by_hash_exact_counts_and_stability():
     assert kept == [] and len(dropped) == 20
     kept, dropped = select_by_hash(ids, 100)
     assert len(kept) == 20 and dropped == []
+
+
+# ----------------------------------------------------------------- integrity
+
+def test_integrity_clean_tree_is_valid():
+    rows = [
+        _row("root", 0, 100, parent=None),
+        _row("a", 10, 90, parent="root"),
+        _row("b", 20, 30, parent="a"),
+        # Endpoints are inclusive: touching the parent's edges is fine.
+        _row("c", 10, 90, parent="root"),
+        # Zero-length span inside the parent is fine.
+        _row("instant", 50, 50, parent="a"),
+    ]
+    assert check_integrity(rows) == []
+
+
+def test_integrity_empty_snapshot_is_valid():
+    assert check_integrity([]) == []
+
+
+def test_integrity_missing_parent_is_flagged_with_span_id():
+    rows = [_row("orphan", 0, 10, parent="ghost")]
+    anomalies = check_integrity(rows)
+    assert len(anomalies) == 1
+    a = anomalies[0]
+    assert a["type"] == MISSING_PARENT
+    assert a["span_ids"] == ["orphan"]
+    assert a["parent_span_id"] == "ghost"
+    assert "ghost" in a["message"]
+
+
+def test_integrity_self_reference_is_its_own_anomaly():
+    rows = [_row("loop", 0, 10, parent="loop")]
+    anomalies = check_integrity(rows)
+    assert len(anomalies) == 1
+    a = anomalies[0]
+    assert a["type"] == SELF_REFERENCE
+    assert a["span_ids"] == ["loop"]
+    assert a["parent_span_id"] == "loop"
+
+
+def test_integrity_two_node_cycle_reported_once():
+    rows = [
+        _row("a", 0, 10, parent="b"),
+        _row("b", 0, 10, parent="a"),
+    ]
+    anomalies = check_integrity(rows)
+    assert len(anomalies) == 1
+    a = anomalies[0]
+    assert a["type"] == CYCLE
+    # Canonical rotation starts at the smallest span id, ring order kept.
+    assert a["span_ids"] == ["a", "b"]
+    assert a["message"] == "cycle of 2 spans detected: a -> b -> a"
+
+
+def test_integrity_three_node_cycle_with_lead_in_chain_reported_once():
+    rows = [
+        # lead-in chain reaches the cycle but adds no second anomaly
+        _row("in", 0, 10, parent="x"),
+        _row("x", 0, 10, parent="y"),
+        _row("y", 0, 10, parent="z"),
+        _row("z", 0, 10, parent="x"),
+    ]
+    anomalies = check_integrity(rows)
+    assert [a["type"] for a in anomalies] == [CYCLE]
+    assert anomalies[0]["span_ids"] == ["x", "y", "z"]
+
+
+def test_integrity_multiple_disjoint_cycles_each_reported_once():
+    rows = [
+        _row("a", 0, 10, parent="b"),
+        _row("b", 0, 10, parent="a"),
+        _row("c", 0, 10, parent="d"),
+        _row("d", 0, 10, parent="e"),
+        _row("e", 0, 10, parent="c"),
+    ]
+    anomalies = check_integrity(rows)
+    assert [a["type"] for a in anomalies] == [CYCLE, CYCLE]
+    assert [a["span_ids"] for a in anomalies] == [
+        ["a", "b"], ["c", "d", "e"],
+    ]
+
+
+def test_integrity_cycle_edges_are_not_time_checked():
+    # A ring whose intervals do not contain one another: only the cycle is
+    # reported, no time_out_of_bounds noise for the ring edges.
+    rows = [
+        _row("a", 0, 100, parent="b"),
+        _row("b", 200, 300, parent="a"),
+    ]
+    anomalies = check_integrity(rows)
+    assert [a["type"] for a in anomalies] == [CYCLE]
+
+
+def test_integrity_child_outside_parent_interval_is_flagged():
+    rows = [
+        _row("root", 10, 100),
+        # starts before and ends after the parent
+        _row("wide", 0, 120, parent="root"),
+    ]
+    anomalies = check_integrity(rows)
+    assert len(anomalies) == 1
+    a = anomalies[0]
+    assert a["type"] == TIME_OUT_OF_BOUNDS
+    assert a["span_ids"] == ["wide", "root"]
+    assert a["parent_span_id"] == "root"
+    assert a["child_start_ns"] == 0
+    assert a["child_end_ns"] == 120
+    assert a["parent_start_ns"] == 10
+    assert a["parent_end_ns"] == 100
+    assert a["start_overflow_ns"] == 10
+    assert a["end_overflow_ns"] == 20
+    assert "before its parent" in a["message"]
+    assert "after its parent" in a["message"]
+
+
+def test_integrity_start_and_end_overflow_reported_separately():
+    rows = [
+        _row("p", 100, 200),
+        _row("early", 90, 150, parent="p"),
+        _row("late", 150, 250, parent="p"),
+        # Exactly contained on both edges: valid.
+        _row("exact", 100, 200, parent="p"),
+    ]
+    anomalies = check_integrity(rows)
+    assert [a["span_ids"] for a in anomalies] == [
+        ["early", "p"], ["late", "p"],
+    ]
+    early, late = anomalies
+    assert early["start_overflow_ns"] == 10
+    assert early["end_overflow_ns"] == 0
+    assert "starts before" in early["message"] and "ends after" not in (
+        early["message"]
+    )
+    assert late["start_overflow_ns"] == 0
+    assert late["end_overflow_ns"] == 50
+    assert "ends after" in late["message"]
+
+
+def test_integrity_orphan_edge_is_not_time_checked():
+    # Parent never arrived: missing_parent only; there is no parent interval
+    # to check containment against.
+    rows = [_row("orphan", 0, 500, parent="ghost")]
+    anomalies = check_integrity(rows)
+    assert [a["type"] for a in anomalies] == [MISSING_PARENT]
+
+
+def test_integrity_anomaly_ordering_is_deterministic():
+    rows = [
+        _row("root", 0, 100),
+        _row("self", 0, 10, parent="self"),
+        _row("orphan", 0, 10, parent="ghost"),
+        _row("c1", 0, 10, parent="c2"),
+        _row("c2", 0, 10, parent="c1"),
+        _row("wide", 1000, 2000, parent="root"),
+    ]
+    types = [a["type"] for a in check_integrity(rows)]
+    assert types == [
+        MISSING_PARENT, SELF_REFERENCE, CYCLE, TIME_OUT_OF_BOUNDS,
+    ]
+    # Re-running yields identical output.
+    assert check_integrity(rows) == check_integrity(list(rows))

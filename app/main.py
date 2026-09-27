@@ -16,6 +16,7 @@ from .models import (
     BatchIngestResponse,
     ConcurrencyResponse,
     DecisionResponse,
+    IntegrityResponse,
     ServiceTimeResponse,
     StatsResponse,
 )
@@ -88,6 +89,7 @@ def root() -> dict[str, str]:
         "decisions": "GET /api/v1/decisions/{trace_id}",
         "service_time": "GET /api/v1/traces/{trace_id}/service-time",
         "concurrency": "GET /api/v1/traces/{trace_id}/concurrency?min_active=2",
+        "integrity": "GET /api/v1/traces/{trace_id}/integrity",
     }
 
 
@@ -164,6 +166,19 @@ def get_concurrency(
     if view is None:
         raise HTTPException(status_code=404, detail="trace not found")
     return ConcurrencyResponse(**view)
+
+
+@app.get(
+    "/api/v1/traces/{trace_id}/integrity",
+    response_model=IntegrityResponse,
+    tags=["traces"],
+    summary="Validate parent references and child/parent time containment",
+)
+def get_integrity(trace_id: str) -> IntegrityResponse:
+    view = get_engine().get_integrity(trace_id)
+    if view is None:
+        raise HTTPException(status_code=404, detail="trace not found")
+    return IntegrityResponse(**view)
 
 
 @app.get("/api/v1/stats", response_model=StatsResponse, tags=["admin"])

@@ -379,6 +379,95 @@ def test_concurrency_works_after_close(client):
     }]
 
 
+def test_integrity_unknown_trace_returns_404(client):
+    resp = client.get("/api/v1/traces/no-such-trace/integrity")
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "trace not found"
+
+
+def test_integrity_clean_open_trace_is_valid_and_follows_snapshot(client):
+    tid = "ig-open"
+    client.post("/api/v1/spans:batch", json={"spans": [
+        _custom_span(tid, "root", 0, 100, service="gateway"),
+        _custom_span(tid, "a", 10, 90, service="auth", parent_span_id="root"),
+    ]})
+
+    resp = client.get(f"/api/v1/traces/{tid}/integrity")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["trace_id"] == tid
+    assert body["span_count"] == 2
+    assert body["anomaly_count"] == 0
+    assert body["valid"] is True
+    assert body["anomalies"] == []
+
+    # A later batch with a bad span flips the snapshot to invalid.
+    client.post("/api/v1/spans:batch", json={"spans": [
+        _custom_span(tid, "bad", 200, 300, service="auth",
+                     parent_span_id="root"),
+    ]})
+    body = client.get(f"/api/v1/traces/{tid}/integrity").json()
+    assert body["span_count"] == 3
+    assert body["valid"] is False
+    assert body["anomaly_count"] == 1
+    anomaly = body["anomalies"][0]
+    assert anomaly["type"] == "time_out_of_bounds"
+    assert anomaly["span_ids"] == ["bad", "root"]
+    assert anomaly["parent_span_id"] == "root"
+    ms = 10**6
+    assert anomaly["start_overflow_ns"] == 0
+    assert anomaly["end_overflow_ns"] == 200 * ms
+
+
+def test_integrity_reports_missing_parent_self_reference_and_cycle_once(client):
+    tid = "ig-refs"
+    client.post("/api/v1/spans:batch", json={"spans": [
+        _custom_span(tid, "root", 0, 100, service="svc"),
+        # Parent never received.
+        _custom_span(tid, "orphan", 0, 10, service="svc",
+                     parent_span_id="ghost"),
+        # Self reference.
+        _custom_span(tid, "self", 0, 10, service="svc",
+                     parent_span_id="self"),
+        # Two-node ring.
+        _custom_span(tid, "c1", 0, 10, service="svc", parent_span_id="c2"),
+        _custom_span(tid, "c2", 0, 10, service="svc", parent_span_id="c1"),
+    ]})
+
+    body = client.get(f"/api/v1/traces/{tid}/integrity").json()
+    assert body["span_count"] == 5
+    assert body["valid"] is False
+    anomalies = body["anomalies"]
+    assert body["anomaly_count"] == len(anomalies) == 3
+
+    by_type = {a["type"]: a for a in anomalies}
+    assert by_type["missing_parent"]["span_ids"] == ["orphan"]
+    assert by_type["missing_parent"]["parent_span_id"] == "ghost"
+    assert by_type["self_reference"]["span_ids"] == ["self"]
+    # The c1<->c2 ring shows up exactly once with both members.
+    assert by_type["cycle"]["span_ids"] == ["c1", "c2"]
+    assert by_type["cycle"]["parent_span_id"] is None
+
+
+def test_integrity_works_after_trace_close(client):
+    tid = "ig-closed"
+    client.post("/api/v1/spans:batch", json={"spans": [
+        _custom_span(tid, "root", 0, 100, service="svc"),
+        _custom_span(tid, "child", 0, 120, service="svc",
+                     parent_span_id="root"),
+    ]})
+    client.post("/api/v1/admin/force-flush")
+
+    body = client.get(f"/api/v1/traces/{tid}/integrity").json()
+    assert body["span_count"] == 2
+    assert body["valid"] is False
+    (anomaly,) = body["anomalies"]
+    assert anomaly["type"] == "time_out_of_bounds"
+    assert anomaly["span_ids"] == ["child", "root"]
+    assert anomaly["end_overflow_ns"] == 20 * 10**6
+    assert anomaly["start_overflow_ns"] == 0
+
+
 def test_decisions_survive_engine_restart(client, tmp_path):
     from app.config import Settings
     from app.engine import SamplingEngine
